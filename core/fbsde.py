@@ -152,6 +152,9 @@ class FBSNN(ABC):
 
         # Optimizers
         self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate)
+        
+        best_loss = float('inf')            
+        best_model_path = f"best_model_{self.mode}_{self.activation}.pt"
 
         start_time = time.time()
         for it in range(previous_it, previous_it + N_Iter):
@@ -178,6 +181,12 @@ class FBSNN(ABC):
                 loss_temp = np.array([])
 
                 self.iteration.append(it)
+
+                # Save model if it has the best loss so far
+                if loss.item() < best_loss:
+                    best_loss = loss.item()
+                    torch.save(self.model.state_dict(), best_model_path)
+                    print(f"Saved new best model at iteration {it}, loss = {best_loss:.3e}")
 
             graph = np.stack((self.iteration, self.training_loss))
         return graph
