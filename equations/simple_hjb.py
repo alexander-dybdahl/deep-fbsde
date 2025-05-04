@@ -2,6 +2,8 @@ import torch
 from core.fbsde import FBSNN
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+import torch.nn as nn
 
 class LQRProblem(FBSNN):
     def __init__(self, Xi, T, M, N, D, layers, mode, activation):
@@ -18,7 +20,7 @@ class LQRProblem(FBSNN):
         term1 = torch.sum((X @ self.Q) * X, dim=1, keepdim=True)
         term2 = 0.5 * torch.sum(a * (a @ self.R), dim=1, keepdim=True)
         return term1 + term2
-
+    
     def g_tf(self, X):
         return torch.sum((X @ self.G) * X, dim=1, keepdim=True)
 
@@ -30,34 +32,174 @@ class LQRProblem(FBSNN):
     def sigma_tf(self, t, X, Y):
         return torch.eye(self.D).unsqueeze(0).repeat(X.shape[0], 1, 1).to(self.device) * 0.1
 
-def riccati_solution(T, t, A, B, Q, R, G):
-    # Here we solve P(t) = solution of dP/dt = -A^T P - P A + P B R^{-1} B^T P - Q, P(T) = G
-    # For 1D we solve explicitly
-    return G * (1 + T - t)
+def riccati_ode(t, P_flat, A, B, Q, Rinv):
+    D = A.shape[0]
+    P = P_flat.reshape(D, D)
+    dPdt = -A.T @ P - P @ A + P @ B @ Rinv @ B.T @ P - Q
+    return dPdt.flatten()
+
+def riccati_solution(T, t_tensor, A, B, Q, R, G):
+    """
+    Returns P(t) evaluated at each t in t_tensor.
+    Assumes A, B, Q, R, G are numpy arrays (D x D)
+    t_tensor: [M, N+1, 1] torch tensor of time points (on GPU)
+    """
+
+    Rinv = np.linalg.inv(R)
+    D = A.shape[0]
+
+    # Time grid for integration
+    t_eval = np.linspace(0, T, t_tensor.shape[1])
+    sol = solve_ivp(
+        fun=lambda t, y: riccati_ode(t, y, A, B, Q, Rinv),
+        t_span=[T, 0],  # integrate BACKWARD
+        y0=G.flatten(),
+        t_eval=t_eval[::-1],  # reverse time grid to match backward solve
+        method='RK45'
+    )
+
+    # Result is shape (D*D, N+1)
+    P_seq = np.copy(sol.y.T[::-1])  # [N+1, D*D] with safe strides
+    P_seq = P_seq.reshape(-1, D, D)  # [N+1, D, D]
+
+    # Broadcast to batch: [M, N+1, D, D]
+    M = t_tensor.shape[0]
+    P_batched = torch.tensor(P_seq, dtype=torch.float32).unsqueeze(0).expand(M, -1, -1, -1).to(t_tensor.device)
+    return P_batched
 
 def u_exact(t, X, P_t):
-    return P_t * X**2
+    """
+    Compute u(t, x) = P(t) * x^2 for 1D, or xᵀ P(t) x for multi-D
+    """
+    if P_t.ndim == 3 and P_t.shape[-1] == 1:
+        # Scalar (1D) case
+        return P_t * X**2  # Elementwise: [M, N+1, 1]
+    
+    # Multi-D logic for P_t: [M, N+1, D, D]
+    M, N_plus_1, D = X.shape
+    if P_t.ndim == 2:  # [D, D]
+        P_t = P_t.unsqueeze(0).unsqueeze(0).expand(M, N_plus_1, D, D)
+    elif P_t.ndim == 4 and P_t.shape[:2] != (M, N_plus_1):
+        raise ValueError(f"Expected P_t shape [M,N+1,D,D], got {P_t.shape}")
+
+    X_unsq = X.unsqueeze(-2)
+    P_X = torch.matmul(X_unsq, P_t)
+    X_P_X = torch.matmul(P_X, X_unsq.transpose(-1, -2))
+    return X_P_X.squeeze(-1).squeeze(-1).unsqueeze(-1)
 
 def a_exact(X, P_t, Rinv, B):
-    return 2 * P_t * X
+    """
+    Compute a*(t, x) = -R⁻¹ Bᵀ ∇u(t, x)
+    Works for both 1D and multi-D.
+    
+    X:      [M, N+1, D]
+    P_t:    [M, N+1, 1] (1D) or [D,D] or [M,N+1,D,D]
+    Rinv:   [D, D]
+    B:      [D, D]
+    Returns: [M, N+1, D]
+    """
+    M, N_plus_1, D = X.shape
+
+    # --- Case 1: Scalar 1D case (D = 1, P_t is [M, N+1, 1]) ---
+    if D == 1 and P_t.ndim == 3 and P_t.shape[-1] == 1:
+        grad_u = 2 * P_t * X  # [M, N+1, 1]
+        return -grad_u        # since R = B = identity in 1D
+
+    # --- Case 2: Constant matrix P_t ---
+    if P_t.ndim == 2:
+        P_t = P_t.unsqueeze(0).unsqueeze(0).expand(M, N_plus_1, D, D)
+
+    # --- Case 3: Check P_t shape ---
+    if P_t.ndim == 4 and P_t.shape[:2] != (M, N_plus_1):
+        raise ValueError(f"P_t shape must be [D,D] or [M,N+1,D,D], got {P_t.shape}")
+
+    # --- General multi-D case ---
+    X_unsq = X.unsqueeze(-2)                         # [M, N+1, 1, D]
+    grad_u = 2 * torch.matmul(X_unsq, P_t).squeeze(-2)  # [M, N+1, D]
+    BTRinv = torch.matmul(B.T, Rinv)                 # [D, D]
+    a = -torch.matmul(grad_u, BTRinv.T)              # [M, N+1, D]
+    return a
+
+
+
+def generate_analytical_data(T=1.0, D=1, n_samples=10000):
+    t_vals = np.random.uniform(0, T, size=(n_samples, 1))
+    x_vals = np.random.normal(loc=0.0, scale=1.0, size=(n_samples, D))
+
+    # Convert to torch
+    t_tensor = torch.tensor(t_vals, dtype=torch.float32)
+    x_tensor = torch.tensor(x_vals, dtype=torch.float32)
+
+    # Compute P(t) from Riccati
+    t_grid = torch.linspace(0, T, steps=100).view(1, -1, 1)
+    P_t_all = riccati_solution(
+        T=T,
+        t_tensor=t_grid.expand(n_samples, -1, -1),
+        A=np.eye(D),
+        B=np.eye(D),
+        Q=np.eye(D),
+        R=np.eye(D),
+        G=np.eye(D),
+    )
+    
+    # Interpolate P at the sample t values
+    idx = np.clip((t_vals * 99).astype(int), 0, 99)
+    P_t = P_t_all[0, idx.squeeze(), :, :]  # [n_samples, D, D]
+
+    # Compute u(t,x)
+    X_unsq = x_tensor.unsqueeze(-2)
+    P_X = torch.bmm(X_unsq, P_t)
+    X_P_X = torch.bmm(P_X, X_unsq.transpose(1, 2)).squeeze()
+    u_vals = X_P_X.unsqueeze(-1)  # [n_samples, 1]
+
+    return t_tensor, x_tensor, u_vals
+
+def pretrain_on_analytical(model, t_tensor, x_tensor, u_vals, epochs=10000, lr=1e-3):
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_fn = nn.MSELoss()
+    
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        inputs = torch.cat([t_tensor, x_tensor], dim=1).to(t_tensor.device)
+        targets = u_vals.to(t_tensor.device)
+        preds = model(inputs)
+
+        loss = loss_fn(preds, targets)
+        loss.backward()
+        optimizer.step()
+
+        if epoch % 100 == 0:
+            print(f"Pretraining Epoch {epoch}, Loss = {loss.item():.6e}")
+
 
 if __name__ == "__main__":
 
     M, N, D = 100, 30, 1
-    layers = [D + 1] + 3 * [64] + [1]
+    layers = [D + 1] + 4 * [64] + [1]
     Xi = np.ones((1, D))
     T = 1.0
-    mode, activation = "FC", "ReLU"
+    mode, activation = "NAIS-Net", "Sine"
     model = LQRProblem(Xi, T, M, N, D, layers, mode, activation)
     try:
-        model_path = "equations/" + f"best_model_{mode}_{activation}.pt"
-        model.model.load_state_dict(torch.load(model_path, map_location=model.device))
+        # model_path = f"best_model_{mode}_{activation}.pt"
+        model_path = "model_NAIS-Net_sine_9000.pt"
+        model.model.load_state_dict(torch.load("equations/" + model_path, map_location=model.device))
         model.model.eval()
         print("Pre-trained model loaded.")
     except FileNotFoundError:
         print("No pre-trained model found. Training from scratch.")
 
-    graph = model.train(1000, 1e-3)
+    epochs = 10000
+
+    t_tensor, x_tensor, u_vals = generate_analytical_data(T=T, D=D)
+    pretrain_on_analytical(
+        model.model, 
+        t_tensor.to(model.device), 
+        x_tensor.to(model.device), 
+        u_vals.to(model.device)
+    )
+    graph = model.train(epochs, 1e-3)
 
     t, W = model.fetch_minibatch()
     X_pred, Y_pred = model.predict(Xi, t, W)
@@ -67,7 +209,15 @@ if __name__ == "__main__":
     Y_np = Y_pred.detach().cpu().numpy()
 
     # exact solution
-    P_t = riccati_solution(T, t, model.A, model.B, model.Q, model.R, model.G)
+    P_t = riccati_solution(
+        T=T,
+        t_tensor=t,  # shape [M, N+1, 1]
+        A=model.A.cpu().numpy(),
+        B=model.B.cpu().numpy(),
+        Q=model.Q.cpu().numpy(),
+        R=model.R.cpu().numpy(),
+        G=model.G.cpu().numpy(),
+    )
     u_ex = u_exact(t, X_pred, P_t).detach().cpu().numpy()
     a_ex = a_exact(X_pred, P_t, torch.inverse(model.R), model.B).detach().cpu().numpy()
 

@@ -17,6 +17,7 @@ class Resnet(nn.Module):
         self.layer5 = nn.Linear(in_features=layers[4], out_features=layers[5])
 
         self.activation = activation
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.epsilon = 0.01
         self.stable = stable
@@ -41,30 +42,30 @@ class Resnet(nn.Module):
         shortcut = out
         if self.stable:
             out = self.stable_forward(self.layer2, out)
-            out += self.layer2_input(u)
+            out = out + self.layer2_input(u)
         else:
             out = self.layer2(out)
         out = self.activation(out)
-        out += shortcut
+        out = out + shortcut
 
         shortcut = out
         if self.stable:
             out = self.stable_forward(self.layer3, out)
-            out += self.layer3_input(u)
+            out = out + self.layer3_input(u)
         else:
             out = self.layer3(out)
         out = self.activation(out)
-        out += shortcut
+        out = out + shortcut
 
         shortcut = out
         if self.stable:
             out = self.stable_forward(self.layer4, out)
-            out += self.layer4_input(u)
+            out = out + self.layer4_input(u)
         else:
             out = self.layer4(out)
 
         out = self.activation(out)
-        out += shortcut
+        out = out + shortcut
 
         out = self.layer5(out)
 

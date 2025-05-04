@@ -100,9 +100,16 @@ if __name__ == "__main__":
     T = 1.0
 
     "Available architectures"
-    mode = "FC"  # FC, Resnet and NAIS-Net are available
+    mode = "NAIS-Net"  # FC, Resnet and NAIS-Net are available
     activation = "Sine"  # Sine and ReLU are available
     model = BlackScholesBarenblatt(Xi, T,
                                    M, N, D,
                                    layers, mode, activation)
-    run_model(model, 1000, 1e-3)
+    try:
+        model_path = "equations/" + f"best_model_{mode}_{activation}.pt"
+        model.model.load_state_dict(torch.load(model_path, map_location=model.device))
+        model.model.eval()
+        print("Pre-trained model loaded.")
+    except FileNotFoundError:
+        print("No pre-trained model found. Training from scratch.")
+    run_model(model, 100, 1e-3)

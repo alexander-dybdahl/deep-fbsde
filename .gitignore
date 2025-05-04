@@ -1,2 +1,7 @@
 __pycache__/
 **/__init__.py
+trained_models/
+*.h5
+*.pt
+*.pth
+*.ckpt
